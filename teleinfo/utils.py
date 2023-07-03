@@ -1,6 +1,4 @@
 
-
-
 class StatusRegisterParser:
 
     POSITION_CONTACT_SEC_POSITION = (0,)
@@ -127,11 +125,8 @@ class StatusRegisterParser:
         binary_string = ""
         for char in self._str:
             binary_string += bin(int(char,16))[2:].zfill(4)
-        s = binary_string[::-1]
-        # s = binary_string
+        s = binary_string[::-1] # Reverse the binary string order to map bits as listed in documentation
         self._bits_str = s
-
-
 
 
 

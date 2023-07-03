@@ -7,31 +7,11 @@ import serial_asyncio
 from homeassistant import config_entries, core
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.sensor import SensorEntity
-from .utils import StatusRegisterParser
+from .utils import TeleinfoIntegration, StatusRegisterParser
 from .const import TELEINFO_KEY, DOMAIN, TeleinfoProtocolType, TeleinfoIndex, EURIDIS_MANUFACTURER, EURIDIS_DEVICE, TELEINFO_STATUS_REGISTER
 
 
 logger = logging.getLogger(__name__)
-
-# async def async_setup(hass, config) -> bool:
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    """Set up the custom serial sensor platform."""
-    # Create an asyncio Event
-    teleinfo_integration_initialyzed = asyncio.Event()
-
-    init_teleinfo_metadata()
-    integration = TeleinfoIntegration(type=TeleinfoProtocolType.STANDARD, add_entities_function=async_add_entities)
-    integration.on_initialized_change = teleinfo_integration_initialyzed.set
-    await integration.setup_serial()
-
-    # Wait for the initialized event
-    await teleinfo_integration_initialyzed.wait()
-    logger.info(f"Setup complete of teleinfo platform, metrics list {integration.metrics}")
-
-    sensors = integration.get_entities()
-    # sensor = TeleinfoMetricSensor(integration)
-    async_add_entities(sensors)
-
 
 async def async_setup_entry(
     hass: core.HomeAssistant,
@@ -43,7 +23,6 @@ async def async_setup_entry(
     logger.info(f"Setupe Teleinfo serial with config {config}")
     teleinfo_integration_initialyzed = asyncio.Event()
 
-    init_teleinfo_metadata()
     integration = TeleinfoIntegration(port=config["port"], type=config["type"])
     integration.on_initialized_change = teleinfo_integration_initialyzed.set
     await integration.setup_serial()
@@ -55,15 +34,98 @@ async def async_setup_entry(
     sensors = integration.get_entities()
     async_add_entities(sensors)
 
-def init_teleinfo_metadata():
-    # Calculate the length of payload to calculate checksum
-    for k, v in TELEINFO_KEY.items():
-        if v.get("timestamp", False):
-            payload_length = len(k) + 1 + 13 + 1 + v["metric_length"] + 1
-            v["payload_length"] = payload_length
-        else:
-            payload_length = len(k) + 1 + v["metric_length"] + 1
-            v["payload_length"] = payload_length
+class TeleinfoChecksumErrorSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_attribution = "Téléinfo"
+
+    def __init__(self, **kwargs):
+        self._state = 0
+        self._device_info = kwargs.get("device_info")
+        self._device_serial = kwargs.get("serial")
+        self._attr_unique_id = f"teleinfo_{self._device_serial}_checksum_error"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return self._device_info
+
+    @property
+    def name(self):
+        return f"Teleinfo checksum errors"
+
+    @property
+    def state(self):
+        return self._state
+    
+    def increment(self):
+        self._state += 1
+        self.async_write_ha_state()
+
+
+class TeleinfoMetricSensor(SensorEntity):
+    _attr_has_entity_name = True
+    _attr_attribution = "Téléinfo"
+
+    def __init__(self, key, value=None, **kwargs):
+        self._key = key
+        self._state = value
+        self._device_info = kwargs.get("device_info")
+        self._device_serial = kwargs.get("serial")
+        self._attr_unique_id = f"teleinfo_standard_{self._device_serial}_{self._key}"
+
+        if c := kwargs.get("property"):
+            self.property = c
+            self._attr_device_class = c._attr_device_class
+            self._attr_native_unit_of_measurement = c._attr_native_unit_of_measurement
+            self._attr_state_class = c._attr_state_class
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return self._device_info
+
+    @property
+    def name(self):
+        return f"Teleinfo {self._key}"
+
+    @property
+    def state(self):
+        return self._state
+    
+    def set_value(self, value):
+        if self._state != value:
+            self._state = value
+            self.async_write_ha_state()
+    
+    def set_disabled(self):
+        self._attr_entity_registry_enabled_default = False
+
+    # async def async_added_to_hass(self):
+    #     await self._integration.setup()
+
+    async def async_will_remove_from_hass(self):
+        # Clean up any resources if needed
+        pass
+
+class TeleinfoStatusRegisterSensor(TeleinfoMetricSensor):
+
+    def __init__(self, key, value=None, **kwargs):
+        self._name = key
+        try:
+            self._value_mapping = TELEINFO_STATUS_REGISTER[key]
+        except KeyError:
+            logger.error(f"Unable to find value mapping for key {key}")
+        super().__init__(key, value=value, **kwargs)
+        self._attr_unique_id = f"teleinfo_standard_{self._device_serial}_status_register_{self._name}"
+
+    @property
+    def name(self):
+        return f"Teleinfo {self._name.replace('_', ' ').title()}"
+
+    @property
+    def state(self):
+        try:
+            return self._value_mapping[int(self._state)]
+        except (ValueError, TypeError):
+            logger.warning(f"Unable to find state {self._state} in {self._value_mapping} for {self._name}")
 
 class TeleinfoIntegration:
 
@@ -227,11 +289,8 @@ class TeleinfoIntegration:
         ar = line.split("\t")
         key = ar[0]
         metric_length = len(ar)
-        # logger.debug(ar)
         if key in TELEINFO_KEY:
             try:
-                # if ar[0] == "ADSC":
-                #     logger.info(f"Received {ar} for ADSC key")
                 metadata = TELEINFO_KEY[key]
                 payload_length = metadata["payload_length"]
                 # If line contain timestamp
@@ -294,97 +353,3 @@ class SerialProtocol(asyncio.Protocol):
     def connection_lost(self, exc):
         # Handle connection lost event if needed
         pass
-
-
-class TeleinfoChecksumErrorSensor(SensorEntity):
-    _attr_has_entity_name = True
-    _attr_attribution = "Téléinfo"
-
-    def __init__(self, **kwargs):
-        self._state = 0
-        self._device_info = kwargs.get("device_info")
-        self._device_serial = kwargs.get("serial")
-        self._attr_unique_id = f"teleinfo_{self._device_serial}_checksum_error"
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return self._device_info
-
-    @property
-    def name(self):
-        return f"Teleinfo checksum errors"
-
-    @property
-    def state(self):
-        return self._state
-    
-    def increment(self):
-        self._state += 1
-        self.async_write_ha_state()
-
-
-class TeleinfoMetricSensor(SensorEntity):
-    _attr_has_entity_name = True
-    _attr_attribution = "Téléinfo"
-
-    def __init__(self, key, value=None, **kwargs):
-        self._key = key
-        self._state = value
-        self._device_info = kwargs.get("device_info")
-        self._device_serial = kwargs.get("serial")
-        self._attr_unique_id = f"teleinfo_standard_{self._device_serial}_{self._key}"
-
-        if c := kwargs.get("property"):
-            self.property = c
-            self._attr_device_class = c._attr_device_class
-            self._attr_native_unit_of_measurement = c._attr_native_unit_of_measurement
-            self._attr_state_class = c._attr_state_class
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        return self._device_info
-
-    @property
-    def name(self):
-        return f"Teleinfo {self._key}"
-
-    @property
-    def state(self):
-        return self._state
-    
-    def set_value(self, value):
-        if self._state != value:
-            self._state = value
-            self.async_write_ha_state()
-    
-    def set_disabled(self):
-        self._attr_entity_registry_enabled_default = False
-
-    # async def async_added_to_hass(self):
-    #     await self._integration.setup()
-
-    async def async_will_remove_from_hass(self):
-        # Clean up any resources if needed
-        pass
-
-class TeleinfoStatusRegisterSensor(TeleinfoMetricSensor):
-
-    def __init__(self, key, value=None, **kwargs):
-        self._name = key
-        try:
-            self._value_mapping = TELEINFO_STATUS_REGISTER[key]
-        except KeyError:
-            logger.error(f"Unable to find value mapping for key {key}")
-        super().__init__(key, value=value, **kwargs)
-        self._attr_unique_id = f"teleinfo_standard_{self._device_serial}_status_register_{self._name}"
-
-    @property
-    def name(self):
-        return f"Teleinfo {self._name.replace('_', ' ').title()}"
-
-    @property
-    def state(self):
-        try:
-            return self._value_mapping[int(self._state)]
-        except (ValueError, TypeError):
-            logger.warning(f"Unable to find state {self._state} in {self._value_mapping} for {self._name}")
