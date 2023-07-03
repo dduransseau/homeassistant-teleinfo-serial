@@ -7,8 +7,9 @@ import serial_asyncio
 from homeassistant import config_entries, core
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.sensor import SensorEntity
-from .utils import TeleinfoIntegration, StatusRegisterParser
-from .const import TELEINFO_KEY, DOMAIN, TeleinfoProtocolType, TeleinfoIndex, EURIDIS_MANUFACTURER, EURIDIS_DEVICE, TELEINFO_STATUS_REGISTER
+
+from .const import TELEINFO_KEY, START_FRAME_DELIMITER, END_FRAME_DELIMITER, DOMAIN, TeleinfoProtocolType, TeleinfoIndex, EURIDIS_MANUFACTURER, EURIDIS_DEVICE, TELEINFO_STATUS_REGISTER
+from .utils import StatusRegisterParser
 
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,8 @@ class TeleinfoIntegration:
         # Start the serial reader
         self._serial_reader = await serial_asyncio.create_serial_connection(
             asyncio.get_running_loop(),
-            lambda: SerialProtocol(self.on_data_received),
+            # lambda: SerialProtocol(self.on_data_received),
+            lambda: SerialProtocol(self.on_frame_received),
             self.port,
             baudrate=self.BAUD_RATE,
             parity=self.SERIAL_PARITY,
@@ -192,7 +194,6 @@ class TeleinfoIntegration:
         logger.info("Serial integration setup successful")
 
     def create_entities(self):
-        self.parse_device_info()
         for key, value, timestamp in self.metrics:
             if not key == "STGE":
                 properties = TELEINFO_KEY[key]
@@ -232,31 +233,35 @@ class TeleinfoIntegration:
     def get_entities(self):
         return self._sensors.values()
 
-    def on_data_received(self, data):
-        # Append the received data to the frame buffer
+    def on_frame_received(self, frame):
+        # logger.debug(f"New frame received: {frame}")
+        sensor_value = self.parse_frame(frame[1:-1])
+
+    # def on_data_received(self, data):
+    #     # Append the received data to the frame buffer
         
-        self._frame_buffer += data
-        # logger.debug(f"Received data: {data}")
-        # Check if a complete frame has been received
+    #     self._frame_buffer += data
+    #     # logger.debug(f"Received data: {data}")
+    #     # Check if a complete frame has been received
                 
-        if self.START_FRAME_DELIMITER in self._frame_buffer and self.END_FRAME_DELIMITER in self._frame_buffer: #
-            if not self.initialyzed:# Clean buffer until receive start of frame
-                start_frame_index = self._frame_buffer.find(self.START_FRAME_DELIMITER)
-                end_frame_index = self._frame_buffer.find(self.END_FRAME_DELIMITER)
-                # logger.debug(f"INITIALIZATION: start index {start_frame_index} end index {end_frame_index} {self._frame_buffer}")
-                if end_frame_index < start_frame_index:
-                    logger.debug(f"Strip buffer content: {self._frame_buffer[:start_frame_index]}")
-                    self._frame_buffer = self._frame_buffer[start_frame_index:]
-                    logger.debug(f"New buffer content: {self._frame_buffer}")
-            # logger.debug(self._frame_buffer)
-            frames = self._frame_buffer.split(self.END_FRAME_DELIMITER+self.START_FRAME_DELIMITER)
-            complete_frames = frames[:-1]
-            self._frame_buffer = frames[-1]
-            # Process the complete frames and update the sensor
-            for frame in complete_frames:
-                self._received_frames += 1
-                sensor_value = self.parse_frame(frame[1:-1]) # Strip START_FRAME_DELIMITER and END_FRAME_DELIMITER
-                # self.update_sensor(sensor_value)
+    #     if self.START_FRAME_DELIMITER in self._frame_buffer and self.END_FRAME_DELIMITER in self._frame_buffer: #
+    #         if not self.initialyzed:# Clean buffer until receive start of frame
+    #             start_frame_index = self._frame_buffer.find(self.START_FRAME_DELIMITER)
+    #             end_frame_index = self._frame_buffer.find(self.END_FRAME_DELIMITER)
+    #             # logger.debug(f"INITIALIZATION: start index {start_frame_index} end index {end_frame_index} {self._frame_buffer}")
+    #             if end_frame_index < start_frame_index:
+    #                 logger.debug(f"Strip buffer content: {self._frame_buffer[:start_frame_index]}")
+    #                 self._frame_buffer = self._frame_buffer[start_frame_index:]
+    #                 logger.debug(f"New buffer content: {self._frame_buffer}")
+    #         # logger.debug(self._frame_buffer)
+    #         frames = self._frame_buffer.split(self.END_FRAME_DELIMITER+self.START_FRAME_DELIMITER)
+    #         complete_frames = frames[:-1]
+    #         self._frame_buffer = frames[-1]
+    #         # Process the complete frames and update the sensor
+    #         for frame in complete_frames:
+    #             self._received_frames += 1
+    #             sensor_value = self.parse_frame(frame[1:-1]) # Strip START_FRAME_DELIMITER and END_FRAME_DELIMITER
+    #             # self.update_sensor(sensor_value)
 
     def parse_frame(self, frame):
         # Parse the frame and extract the sensor value
@@ -266,7 +271,7 @@ class TeleinfoIntegration:
         if self.initialyzed:
             metrics_lines = frame_str.split("\r\n")
             for l in metrics_lines:
-                if metric := self.parse_metric_line(l):
+                if metric := self.parse_line(l):
                     self.update_entity(*metric)
         else: # List the metrics to create Entities
             if frame_str.startswith("\n"):
@@ -276,16 +281,17 @@ class TeleinfoIntegration:
             logger.debug(f"Initialyze frame: {frame_str}")
             logger.debug(f"Splitted frame: {metrics_lines}")
             for l in metrics_lines:
-                if metric := self.parse_metric_line(l):
+                if metric := self.parse_line(l):
                     # logger.debug(f"Metric key {metric[0]} {metric[1]}")
                     if metric[0] == "ADSC":
                         self.device_id = metric[1]
                         logger.info("Set teleinfo device id")
+                        self.parse_device_info()
                     elif not metric[0] in ("DATE", "VTIC"): # , "STGE"
                         self.metrics.add(metric)
             self.create_entities()
 
-    def parse_metric_line(self, line):
+    def parse_line(self, line):
         ar = line.split("\t")
         key = ar[0]
         metric_length = len(ar)
@@ -311,8 +317,6 @@ class TeleinfoIntegration:
                         value = metadata["content_type"](value)
                     except ValueError:
                         logger.error(f'Unable to parse value for {key} {value} in type {metadata["content_type"]}')
-                    # if key == 'DATE':
-                    #     value = ts_tz 
                     return (key, value, ts)
                 else:
                     self.checksum_sensor.increment()
@@ -345,11 +349,56 @@ class TeleinfoIntegration:
 class SerialProtocol(asyncio.Protocol):
     def __init__(self, callback):
         self._callback = callback
+        self._buffer = b""
+        self._incomplete_frame = True
+
+    # def data_received(self, data):
+    #     if self._callback:
+    #         self._callback(data)
 
     def data_received(self, data):
-        if self._callback:
-            self._callback(data)
+        self._buffer += data
+        self.process_buffer()
 
-    def connection_lost(self, exc):
-        # Handle connection lost event if needed
-        pass
+    def process_buffer(self):
+        while START_FRAME_DELIMITER in self._buffer:
+            start_index = self._buffer.find(START_FRAME_DELIMITER)
+            self._buffer = self._buffer[start_index:]
+
+            end_index = self._buffer.find(END_FRAME_DELIMITER)
+            if end_index != -1:
+                complete_frame = self._buffer[1:end_index]
+                self._callback(complete_frame)
+                self._buffer = self._buffer[end_index + 1:]
+                self.incomplete_frame = False
+            else:
+                self.incomplete_frame = True
+                break
+
+    #     if START_FRAME_DELIMITER in self._buffer and END_FRAME_DELIMITER in self._buffer: #
+    #         start_frame_index = self._buffer.find(START_FRAME_DELIMITER)
+    #         end_frame_index = self._buffer.find(END_FRAME_DELIMITER)
+    #         # logger.debug(f"INITIALIZATION: start index {start_frame_index} end index {end_frame_index} {self._buffer}")
+    #         if end_frame_index < start_frame_index:
+    #             # logger.debug(f"Strip buffer content: {self._buffer[:start_frame_index]}")
+    #             self._frame_buffer = self._buffer[start_frame_index-2:]
+    #             # logger.debug(f"New buffer content: {self._buffer}")
+    #         # logger.debug(self._frame_buffer)
+    #             frames = self._buffer.split(END_FRAME_DELIMITER)
+    #         else:
+    #             frames = self._buffer.split(END_FRAME_DELIMITER+START_FRAME_DELIMITER)
+    #         complete_frames = frames[:-1]
+    #         self._buffer = frames[-1]
+    #         # Process the complete frames and update the sensor
+    #         for frame in complete_frames:
+    #             self._callback(frame[1:-1])
+                # sensor_value = self.parse_frame(frame[1:-1]) # Strip START_FRAME_DELIMITER and END_FRAME_DELIMITER
+        # while True:
+        #     start_index = self._buffer.find(START_FRAME_DELIMITER)
+        #     end_index = self._buffer.find(END_FRAME_DELIMITER)
+        #     if start_index != -1 and end_index != -1:
+        #         complete_frame = self._buffer[start_index + 1:end_index]
+        #         asyncio.ensure_future(self._callback(complete_frame))
+        #         self._buffer = self._buffer[end_index + 1:]
+        #     else:
+        #         break

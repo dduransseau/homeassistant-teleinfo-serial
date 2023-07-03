@@ -129,7 +129,6 @@ class StatusRegisterParser:
         self._bits_str = s
 
 
-
 if __name__ == "__main__":
 
     STGE = "00DA0001"

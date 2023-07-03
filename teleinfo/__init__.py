@@ -1,15 +1,14 @@
 import logging
 
 from homeassistant import config_entries, core
-from homeassistant.helpers.typing import ConfigType
 from homeassistant.const import Platform
 
-from .const import TELEINFO_KEY, DOMAIN
+from .const import DOMAIN, TELEINFO_KEY
 
 _LOGGER = logging.getLogger(__name__)
 
 def init_teleinfo_metadata():
-    # Calculate the length of payload to calculate checksum
+    # Calculate the length of payload checksum validation
     for k, v in TELEINFO_KEY.items():
         if v.get("timestamp", False):
             payload_length = len(k) + 1 + 13 + 1 + v["metric_length"] + 1

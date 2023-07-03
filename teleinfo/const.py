@@ -8,6 +8,10 @@ from homeassistant.components.sensor import (
 
 DOMAIN = "teleinfo"
 
+
+START_FRAME_DELIMITER = b'\x02'
+END_FRAME_DELIMITER = b'\x03'
+
 class TeleinfoProtocolType:
     HISTORIQUE = "historique"
     STANDARD = "standard"
@@ -226,8 +230,6 @@ TELEINFO_STATUS_REGISTER = {
 	"preavis_pm": TELEINFO_STEG14,
 	"pm": TELEINFO_STEG15
 }
-
-
 
 EURIDIS_MANUFACTURER = {'01': 'CROUZET / MONETEL',
  '02': 'SAGEM / SAGEMCOM',
