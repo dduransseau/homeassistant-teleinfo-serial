@@ -7,9 +7,8 @@ import serial_asyncio
 from homeassistant import config_entries, core
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.sensor import SensorEntity
-
-from .const import TELEINFO_KEY, START_FRAME_DELIMITER, END_FRAME_DELIMITER, DOMAIN, TeleinfoProtocolType, TeleinfoIndex, EURIDIS_MANUFACTURER, EURIDIS_DEVICE, TELEINFO_STATUS_REGISTER
 from .utils import StatusRegisterParser
+from .const import TELEINFO_KEY, START_FRAME_DELIMITER, END_FRAME_DELIMITER, DOMAIN, TeleinfoProtocolType, TeleinfoIndex, EURIDIS_MANUFACTURER, EURIDIS_DEVICE, TELEINFO_STATUS_REGISTER
 
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,7 @@ async def async_setup_entry(
 ):
     """Setup sensors from a config entry created in the integrations UI."""
     config = hass.data[DOMAIN][config_entry.entry_id]
-    logger.info(f"Setupe Teleinfo serial with config {config}")
+    logger.info(f"Setup Teleinfo serial with config {config}")
     teleinfo_integration_initialyzed = asyncio.Event()
 
     integration = TeleinfoIntegration(port=config["port"], type=config["type"])
@@ -102,9 +101,9 @@ class TeleinfoMetricSensor(SensorEntity):
     # async def async_added_to_hass(self):
     #     await self._integration.setup()
 
-    async def async_will_remove_from_hass(self):
-        # Clean up any resources if needed
-        pass
+    # async def async_will_remove_from_hass(self):
+    #     # Clean up any resources if needed
+    #     pass
 
 class TeleinfoStatusRegisterSensor(TeleinfoMetricSensor):
 
@@ -128,6 +127,9 @@ class TeleinfoStatusRegisterSensor(TeleinfoMetricSensor):
         except (ValueError, TypeError):
             logger.warning(f"Unable to find state {self._state} in {self._value_mapping} for {self._name}")
 
+class ChecksumValidationError(Exception):
+    """Error on checksum line validation"""
+
 class TeleinfoIntegration:
 
     SERIAL_PARITY = serial.PARITY_EVEN
@@ -138,18 +140,40 @@ class TeleinfoIntegration:
     END_FRAME_DELIMITER = b'\x03'
 
     @staticmethod
-    def validate_checksum(data, check):
+    def _validate_checksum(data, check):
         chksum = sum([ord(c) for c in data])
         chksum = (chksum & 0x3F) + 0x20
         if chr(chksum) == check:
             return True
         else:
-            return False
+            raise ChecksumValidationError()
+
+    def validate_checksum(self, data, check):
+        if self._checksum_control_mode and self._checksum_control_mode == 2:
+            return self._validate_checksum(data, check)
+        elif self._checksum_control_mode and self._checksum_control_mode == 1:
+            return self._validate_checksum(data[:-1], check)
+        else:
+            try:
+                result = self._validate_checksum(data, check)
+                if result:
+                    self._checksum_control_mode = 2
+                    logger.debug("Set checksum control methode to mode 2")
+                return result 
+            except ChecksumValidationError:
+                result = self._validate_checksum(data[:-1], check)
+                if result:
+                    self._checksum_control_mode = 1
+                    logger.debug("Set checksum control methode to mode 1")
+                    return result
+                else:
+                    raise
 
     def __init__(self, port='/dev/ttyUSB0', type=TeleinfoProtocolType.HISTORIQUE):
         self._serial_reader = None
         self.port = port
         self.device_id = None
+        self.type = type
         self._device = None
         self.metrics  = set()
         self._sensors = {}
@@ -158,10 +182,11 @@ class TeleinfoIntegration:
         self._frame_buffer = b""
         self._frame_dict_buffer = dict()
         self._received_frames = 0
+        self._checksum_control_mode = None
         self.checksum_sensor = None
         self.status_parser = StatusRegisterParser()
         
-        if type == TeleinfoProtocolType.STANDARD:
+        if self.type == TeleinfoProtocolType.STANDARD:
             self.BAUD_RATE = 9600
         else:
             self.BAUD_RATE = 1200
@@ -190,44 +215,6 @@ class TeleinfoIntegration:
             parity=self.SERIAL_PARITY,
             stopbits=self.SERIAL_STOP_BITS,
             bytesize=self.SERIAL_BYTE_SIZE
-        )
-        logger.info("Serial integration setup successful")
-
-    def create_entities(self):
-        for key, value, timestamp in self.metrics:
-            if not key == "STGE":
-                properties = TELEINFO_KEY[key]
-                properties_class = properties.get("class")
-                sensor = TeleinfoMetricSensor(key, value, device_info=self.device_info, serial=self.device_id, property=properties_class)
-                if properties_class == TeleinfoIndex and int(value) == 0: #Avoid to create sensor for unused index
-                    sensor.set_disabled()
-                self._sensors[key] = sensor
-            else: # Manage status register differently since it host multiple sensors
-                self.status_parser.parse_str(value)
-                for status_key in TELEINFO_STATUS_REGISTER.keys():
-                    status_value = getattr(self.status_parser, status_key)
-                    # logger.debug(f"Init status {status_key}, with value {status_value}")
-                    sensor = TeleinfoStatusRegisterSensor(status_key, value=status_value, device_info=self.device_info, serial=self.device_id)
-                    # logger.info(f"Parse status register and check contact sec status {self.status_parser.contact_sec}")
-                    self._sensors[f"status_register|{status_key}"] = sensor
-        self.checksum_sensor = TeleinfoChecksumErrorSensor(device_info=self.device_info, serial=self.device_id)
-        self._sensors["checksum_errors"] = self.checksum_sensor
-        self.set_initialized(True)
-
-    def parse_device_info(self):
-        if self.device_id:
-            manufacturer_code = self.device_id[:2]
-            model_code = self.device_id[4:6]
-            logger.info(f"Device id is {self.device_id}, manufacturer code is {manufacturer_code} model code is {model_code}")
-            manufacturer_name = EURIDIS_MANUFACTURER.get(manufacturer_code)
-            model_name = EURIDIS_DEVICE.get(model_code)
-            self._device = DeviceInfo(
-            identifiers={
-                (DOMAIN, self.device_id)
-            },
-            name=f"PRM_{self.device_id}",
-            manufacturer=manufacturer_name,
-            model=model_name
         )
 
     def get_entities(self):
@@ -269,81 +256,126 @@ class TeleinfoIntegration:
         # logger.debug(frame)
         frame_str = frame.decode("ascii")
         if self.initialyzed:
-            metrics_lines = frame_str.split("\r\n")
-            for l in metrics_lines:
+            for l in frame_str.split("\r\n"):
                 if metric := self.parse_line(l):
                     self.update_entity(*metric)
         else: # List the metrics to create Entities
-            if frame_str.startswith("\n"):
-                logger.debug("Frame start with a \\n char")
-                frame_str = frame_str[1:]
-            metrics_lines = frame_str.split("\r\n")
-            logger.debug(f"Initialyze frame: {frame_str}")
-            logger.debug(f"Splitted frame: {metrics_lines}")
-            for l in metrics_lines:
-                if metric := self.parse_line(l):
-                    # logger.debug(f"Metric key {metric[0]} {metric[1]}")
-                    if metric[0] == "ADSC":
-                        self.device_id = metric[1]
-                        logger.info("Set teleinfo device id")
-                        self.parse_device_info()
-                    elif not metric[0] in ("DATE", "VTIC"): # , "STGE"
-                        self.metrics.add(metric)
-            self.create_entities()
-
+            logger.debug(f"Initialization frame received: {frame_str}")
+            self.setup_entities(frame_str)
+            
     def parse_line(self, line):
-        ar = line.split("\t")
+        ar = line.split() # Standard = "\t" historique = " "
         key = ar[0]
-        metric_length = len(ar)
-        if key in TELEINFO_KEY:
-            try:
-                metadata = TELEINFO_KEY[key]
-                payload_length = metadata["payload_length"]
-                # If line contain timestamp
-                if metric_length == 4:
-                    ts = ar[1]
-                    value = ar[2]
-                    checksum = ar[3]
-                elif metric_length == 3:
-                    value = ar[1]
-                    checksum = ar[2]
-                    ts = None
-                else:
-                    logger.debug(f"Error in line {ar}, not composed by 3 or 4 elements")
-                    return None
-                if self.validate_checksum(line[:payload_length], checksum):
-                    try:
-                        value = value.strip()
-                        value = metadata["content_type"](value)
-                    except ValueError:
-                        logger.error(f'Unable to parse value for {key} {value} in type {metadata["content_type"]}')
-                    return (key, value, ts)
-                else:
-                    self.checksum_sensor.increment()
-                    # logger.debug(f"Error in checksum for {ar}")
-            except IndexError:
-                logger.warning(f"Error in parsing of line in {ar}")
-        else:
+        metric_parts_length = len(ar)
+        try:
+            metadata = TELEINFO_KEY[key]
+            payload_length = metadata["payload_length"]
+            # If line contain timestamp
+            if metric_parts_length == 4:
+                ts = ar[1]
+                value = ar[2]
+                checksum = ar[3]
+            elif metric_parts_length == 3:
+                value = ar[1]
+                checksum = ar[2]
+                ts = None
+            else:
+                logger.debug(f"Error in line {ar}, not composed by 3 or 4 elements")
+                return None
+            self.validate_checksum(line[:payload_length], checksum)
+            # if self.type == TeleinfoProtocolType.STANDARD: # TODO: Implement checksum control for historique
+            #     self.validate_checksum(line[:payload_length], checksum)
+            # else:
+            #     logger.debug(f"Historique data to control: |{line[:payload_length]}|checksum chr: {checksum}")
+            value = value.strip()
+            value = metadata["content_type"](value)
+            return (key, value, ts)
+        except KeyError:
             logger.debug(f"Found unknown key: {key} | {ar}")
+        except ValueError:
+            logger.debug(f'Unable to parse value for {key} {value} in type {metadata["content_type"]}')
+        except IndexError:
+            logger.debug(f"Error in parsing of line in {ar}")
+        except ChecksumValidationError:
+            try:
+                self.checksum_sensor.increment()
+            except AttributeError:
+                pass # Checksum sensor is not initialyzed yet
+            # logger.debug(f"Error in checksum for {ar}")
+        
+
+    def update_entity(self, key, value, timestamp):
+        # Update the sensor entity with the new value
+        try:
+            if key != "STGE":
+                entity = self._sensors.get(key)
+                if entity:
+                    # logger.debug(f"Update sensor {key} with value {value}")
+                    entity.set_value(value)
+            else:
+                self.status_parser.parse_str(value)
+                for status_key in TELEINFO_STATUS_REGISTER.keys():
+                    entity = self._sensors.get(f"status_register|{status_key}")
+                    entity.set_value(getattr(self.status_parser, status_key))
+        except Exception:
+            logger.debug(f"Unable to update entity key {key} with value: {value}")
+
+    def setup_entities(self, frame_str):
+        metrics_lines = frame_str.split("\r\n")
+        logger.debug(f"Initialyze frame: {frame_str}")
+        logger.debug(f"Splitted frame: {metrics_lines}")
+        for l in metrics_lines:
+            if metric := self.parse_line(l):
+                if metric[0] in ("ADCO", "ADSC"):
+                    self.device_id = metric[1]
+                    logger.info("Set teleinfo device id")
+                    self.set_device_info()
+                elif not metric[0] in ("DATE", "VTIC"): # , "STGE"
+                    self.metrics.add(metric)
+        self.set_entities()
+
+    def set_device_info(self):
+        if self.device_id:
+            manufacturer_code = self.device_id[:2]
+            model_code = self.device_id[4:6]
+            logger.debug(f"Device id is {self.device_id}, manufacturer code is {manufacturer_code} model code is {model_code}")
+            manufacturer_name = EURIDIS_MANUFACTURER.get(manufacturer_code)
+            model_name = EURIDIS_DEVICE.get(model_code)
+            self._device = DeviceInfo(
+            identifiers={
+                (DOMAIN, self.device_id)
+            },
+            name=f"PRM_{self.device_id}",
+            manufacturer=manufacturer_name,
+            model=model_name
+        )
+
+    def set_entities(self):
+        for key, value, timestamp in self.metrics:
+            if not key == "STGE": # Manage alla lines that are not status register
+                properties = TELEINFO_KEY[key]
+                properties_class = properties.get("class")
+                sensor = TeleinfoMetricSensor(key, value, device_info=self.device_info, serial=self.device_id, property=properties_class)
+                if properties_class == TeleinfoIndex and int(value) == 0: #Avoid to create sensor for unused index
+                    sensor.set_disabled()
+                self._sensors[key] = sensor
+            else: # Manage status register differently since it host multiple sensors
+                self.status_parser.parse_str(value)
+                for status_key in TELEINFO_STATUS_REGISTER.keys():
+                    status_value = getattr(self.status_parser, status_key)
+                    # logger.debug(f"Init status {status_key}, with value {status_value}")
+                    sensor = TeleinfoStatusRegisterSensor(status_key, value=status_value, device_info=self.device_info, serial=self.device_id)
+                    # logger.info(f"Parse status register and check contact sec status {self.status_parser.contact_sec}")
+                    self._sensors[f"status_register|{status_key}"] = sensor
+        # Setup base checksum error sensor to count checksum error
+        self.checksum_sensor = TeleinfoChecksumErrorSensor(device_info=self.device_info, serial=self.device_id)
+        self._sensors["checksum_errors"] = self.checksum_sensor
+        self.set_initialized(True)
             
     async def cleanup(self):
         if self._serial_reader:
             self._serial_reader.close()
             await self._serial_reader.wait_closed()
-
-
-    def update_entity(self, key, value, timestamp):
-        # Update the sensor entity with the new value
-        if key != "STGE":
-            entity = self._sensors.get(key)
-            if entity:
-                # logger.debug(f"Update sensor {key} with value {value}")
-                entity.set_value(value)
-        else:
-            self.status_parser.parse_str(value)
-            for status_key in TELEINFO_STATUS_REGISTER.keys():
-                entity = self._sensors.get(f"status_register|{status_key}")
-                entity.set_value(getattr(self.status_parser, status_key))
 
 
 class SerialProtocol(asyncio.Protocol):
